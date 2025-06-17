@@ -6,7 +6,7 @@
 Gets all human identity in the specified Active Directory Domain.
 
 .DESCRIPTION
-The "Get-AdHumainIdentity.ps1" script collects xxxxxxx
+The "Get-AdHumanIdentity.ps1" script collects xxxxxxx
 
 There are options to refine the search of the identities. See the parameters section for more details.
 
@@ -27,11 +27,11 @@ Updated by xxxx: 17/05/2025 -  Added support for Parameters for "name like ident
     
 
 .EXAMPLE
-./Get-AdHumainIdentity.ps1
+./Get-AdHumanIdentity.ps1
 Runs the script against the default domain the user has access to
 
 .EXAMPLE
-./Get-AdHumainIdentity.ps1 -UserServiceAccountNameLike "svc-,service"
+./Get-AdHumanIdentity.ps1 -UserServiceAccountNameLike "svc-,service"
 Runs the script and check user used as service account with specific naming convention
 
 .LINK
@@ -56,7 +56,7 @@ $CurrentCulture = [System.Globalization.CultureInfo]::CurrentCulture
 $date = Get-Date
 $date_string = $($date.ToString("yyyy-MM-dd_HHmmss"))
 
-$output_log = "output_ad_humain_identity_$date_string.log"
+$output_log = "output_ad_Human_identity_$date_string.log"
 
 if (Test-Path "./$output_log") {
   Remove-Item -Path "./$output_log"
@@ -126,7 +126,7 @@ $TotalUserWithSpecificName = ($UserWithSpecificName | Measure-Object).Count
 
 switch ($PSCmdlet.ParameterSetName) {
   'UserServiceAccountNamesLike' {
-    Write-Host "Finding specified Non humain Identity with naming convention(s)..." -ForegroundColor Green
+    Write-Host "Finding specified Non Human Identity with naming convention(s)..." -ForegroundColor Green
     $subs = @()
     foreach ($UserServiceAccountNameLike in $UserServiceAccountNamesLike.split(',')) {
     Write-Host "Getting non-human information for: $($UserServiceAccountNameLike.Trim())..."
@@ -145,9 +145,9 @@ switch ($PSCmdlet.ParameterSetName) {
   }
   if ($subs.Count -gt 0) {
       $subs | Export-Csv -Path $outputUserAsServiceAccount -NoTypeInformation  -Encoding UTF8
-      Write-Host "Non humain Identity information saved to: $outputUserAsServiceAccount" -ForegroundColor Green
+      Write-Host "Non Human Identity information saved to: $outputUserAsServiceAccount" -ForegroundColor Green
     } else {
-      Write-Host "No Non humain Identity found with the specified naming convention(s)." -ForegroundColor Yellow
+      Write-Host "No Non Human Identity found with the specified naming convention(s)." -ForegroundColor Yellow
     }
   }
 } 
