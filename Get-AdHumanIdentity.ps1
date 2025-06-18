@@ -1,179 +1,224 @@
-# requires -Version 7.0
-# requires -Modules ActiveDirectory
-
 <#
 .SYNOPSIS
-Gets all human identity in the specified Active Directory Domain.
+    Active Directory Domain User and Service Account Audit Script
 
 .DESCRIPTION
-The "Get-AdHumanIdentity.ps1" script collects xxxxxxx
-
-There are options to refine the search of the identities. See the parameters section for more details.
-
-A summary of the information found by this script will be sent to console.
-One or more CSV files will be saved to the same directory where the script ran with the detailed information.
-Please copy/paste the console output and send it along with the CSV files to the person that asked you to run
-this script.
+    This script audits one or more Active Directory domains in a Forest to:
+    - Identify enabled user accounts
+    - Analyze user logon activity (active, inactive, never logged in)
+    - Optionally filter and export service accounts by naming patterns
+    - Summarize results by OU or by Domain
+    - Provide per-domain statistics on service accounts and password policies
 
 .PARAMETER UserServiceAccountNamesLike
-A comma separated list of Service Account naming convention to gather data from.
+    Optional. An array of wildcard patterns to identify potential service accounts (e.g. "*svc*", "*_sa").
+
+.PARAMETER SpecificDomains
+    Optional. An array of AD domain names to target. If omitted, all domains in the current forest will be scanned.
+
+.PARAMETER Mode
+    Required. Defines the report output style.
+        - "UserPerOU": Shows total, active, inactive, and never-logged-in users per OU
+        - "Summary"  : Shows a per-domain summary only (aggregate user stats)
+
+.OUTPUT
+    CSV files saved to the "ADReports" directory containing:
+        - OU-level or domain-level user logon summaries
+        - Matched service account exports
+        - Per-domain service account policy summary (MSAs, gMSAs, non-expiring users)
+
+.EXAMPLE
+    .\Audit-AD.ps1 -Mode Summary
+
+    Runs a forest-wide scan and produces a summary of user login stats and service account stats per domain.
+
+.EXAMPLE
+    .\Audit-AD.ps1 -SpecificDomains @("contoso.com", "fabrikam.com") -UserServiceAccountNamesLike @("*svc*", "*sys*") -Mode UserPerOU
+
+    Scans only the specified domains, exports user login activity per OU, and finds service accounts matching the provided patterns.
 
 .NOTES
-Written by Aymeric Jaouen for community usage
-GitHub: aymeric.jaouen
-Date: 16/06/2025
-Updated by xxxx: 17/05/2025 -  Added support for Parameters for "name like identity"
-                            -  Added support for ManagedServiceAccount
-    
-
-.EXAMPLE
-./Get-AdHumanIdentity.ps1
-Runs the script against the default domain the user has access to
-
-.EXAMPLE
-./Get-AdHumanIdentity.ps1 -UserServiceAccountNameLike "svc-,service"
-Runs the script and check user used as service account with specific naming convention
-
-.LINK
-https://build.rubrik.com
-https://github.com/rubrikinc
+    Author: Aymeric ✨  
+    Created: 18/06/2025
+    Requires: ActiveDirectory module (RSAT)
 #>
 
 param (
- # Option to add User names used as service account.
-  [Parameter(ParameterSetName='UserServiceAccountNamesLike', Mandatory=$false)]
-  [ValidateNotNullOrEmpty()]
-  [string]$UserServiceAccountNamesLike = ''
+    [string[]]$UserServiceAccountNamesLike,
+    [string[]]$SpecificDomains,
+    [ValidateSet("UserPerOU", "Summary")]
+    [string]$Mode = "UserPerOU"
 )
 
 # Save the current culture so it can be restored later
 $CurrentCulture = [System.Globalization.CultureInfo]::CurrentCulture
 
-# Set the culture to en-US; this is to ensure that output to CSV is formatted properly
+# Ensure output culture is consistent
 [System.Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
 [System.Threading.Thread]::CurrentThread.CurrentUICulture = 'en-US'
 
 $date = Get-Date
-$date_string = $($date.ToString("yyyy-MM-dd_HHmmss"))
-
-$output_log = "output_ad_Human_identity_$date_string.log"
-
-if (Test-Path "./$output_log") {
-  Remove-Item -Path "./$output_log"
-}
-
-Write-Host "Arguments passed to $($MyInvocation.MyCommand.Name):" -ForeGroundColor Green
-$PSBoundParameters | Format-Table
-
-# Import-Module -ActiveDirectory
-
-try{
-
-# Filenames of the CSVs to output
 $fileDate = $date.ToString("yyyy-MM-dd_HHmm")
-$outputUserAsServiceAccount = "ad_user_as_service_account_info-$($fileDate).csv"
-$outputUserPerOU = "ad_user_per_OU_info-$($fileDate).csv"
-$outputSummary = "Summary_all_users_info-$($fileDate).csv"
+$logonThreshold = (Get-Date).AddDays(-180).ToFileTime()
+$summary = @()
 
+# Create output directory if needed
+$outputPath = ".\ADReports"
+if (-not (Test-Path $outputPath)) { New-Item -Path $outputPath -ItemType Directory | Out-Null }
+
+# Helper: Extract OU from DN
+function Get-OUFromDN($dn) {
+    ($dn -split '(?<!\\),')[1..($dn.Count - 1)] -join ','
 }
-catch {
-  Write-Error "Unable to create OutPut file."
-  Write-Error "Error: $_"
-}
 
-#Inactive user at the today's date - 180 days (6 months)
-$logondate = (Get-Date).AddDays(-180).ToFileTime()
-
-# Get all enabled users with LastLogonTimestamp attribute
-$EnabledUsers = Get-ADUser -Filter {Enabled -eq $true} -Properties LastLogonTimestamp
-
-# Count active users (logged in within last 6 months)
-$ActiveUsers = $EnabledUsers | Where-Object { $_.LastLogonTimestamp -and $_.LastLogonTimestamp -ge $logondate }
-$TotalActive = ($ActiveUsers  | Measure-Object).Count
-
-# Count inactive users (no login in 6+ months)
-$InactiveUsers = $EnabledUsers | Where-Object { $_.LastLogonTimestamp -and $_.LastLogonTimestamp -lt $logondate }
-$TotalInactive = $InactiveUsers.Count
-
-# Count users with no LastLogonTimestamp (never logged in).  New accounts and service accounts that don't use interactive login
-$NeverLoggedInUsers = $EnabledUsers | Where-Object { -not $_.LastLogonTimestamp }
-$TotalNeverLoggedIn = $NeverLoggedInUsers.Count
-
-# Total enabled users
-$TotalEnabled = $EnabledUsers.Count
-
-#---------------------------------------------------------#
-# ManagedService Account
-$ManagedServiceAccount = Get-ADServiceAccount -Filter * | Where-Object {$_.objectClass -eq "msDS-ManagedServiceAccount"}
-$TotalManagedService = ($ManagedServiceAccount | Measure-Object).Count
-
-# GroupManagedService Account
-$GroupManagedService = Get-ADServiceAccount -Filter * | Where-Object {$_.objectClass -eq "msDS-GroupManagedServiceAccount"} 
-$TotalGroupManagedService = ($GroupManagedService | Measure-Object).Count
-
-# Users with Password never expires that might be used as Service Account
-$UserPasswordNotExpired = Get-ADUser -Filter {PasswordNeverExpires -eq $true}
-#$TotalUserPasswordNotExpired = $UserPasswordNotExpired.Count
-$TotalUserPasswordNotExpired = ($UserPasswordNotExpired | Measure-Object).Count
-
-# Users per OU
-Get-ADOrganizationalUnit -Filter * | ForEach-Object { Get-ADUser -Filter * -SearchBase $_.DistinguishedName | Measure-Object | Select-Object Name, Count } |
-Export-csv -Path $outputUserPerOU -NoTypeInformation
-
-#Get User with names starting with svc
-$UserWithSpecificName = Get-ADUser -Filter 'Name -like "svc*"'
-$TotalUserWithSpecificName = ($UserWithSpecificName | Measure-Object).Count
-
-switch ($PSCmdlet.ParameterSetName) {
-  'UserServiceAccountNamesLike' {
-    Write-Host "Finding specified Non Human Identity with naming convention(s)..." -ForegroundColor Green
+# Function: Export filtered users matching naming patterns
+function Get-UsersAsServiceAccount {
+    param (
+        [string[]]$NamePatterns,
+        [string]$Domain,
+        [string]$OutputFile
+    )
     $subs = @()
-    foreach ($UserServiceAccountNameLike in $UserServiceAccountNamesLike.split(',')) {
-    Write-Host "Getting non-human information for: $($UserServiceAccountNameLike.Trim())..."
-    try {
-        # Get-ADUser directly, without Format-Table, and select desired properties
-        $usersFound = Get-ADUser -Filter "Name -like '$($UserServiceAccountNameLike.Trim())'" -Properties Name, DistinguishedName, Enabled, LastLogonTimestamp, PasswordNeverExpires, ServicePrincipalName |
-                      Select-Object Name, DistinguishedName, Enabled, LastLogonTimestamp, PasswordNeverExpires, ServicePrincipalName
+    foreach ($pattern in $NamePatterns) {
+        Write-Host "[$Domain] Searching for users like '$pattern'..." -ForegroundColor Yellow
+        try {
+            $usersFound = Get-ADUser -Server $Domain -Filter "Name -like '$($pattern.Trim())'" `
+                -Properties Name, DistinguishedName, Enabled, LastLogonTimestamp, PasswordNeverExpires, ServicePrincipalName |
+                Select-Object Name, DistinguishedName, Enabled, @{Name="LastLogonDate";Expression={[DateTime]::FromFileTime($_.LastLogonTimestamp)}}, PasswordNeverExpires, @{Name="ServicePrincipalNames";Expression={ $_.ServicePrincipalName -join ";" }}
 
-        # Add the found users to the $subs array
-        $subs += $usersFound
-    } catch {
-        Write-Error "Unable to get information for users like: $($UserServiceAccountNameLike.Trim())"
-        Write-Error "Error: $_"
-        Continue
+            $subs += $usersFound
+        } catch {
+            Write-Warning "[$Domain] Error searching pattern '$pattern': $_"
+        }
     }
-  }
-  if ($subs.Count -gt 0) {
-      $subs | Export-Csv -Path $outputUserAsServiceAccount -NoTypeInformation  -Encoding UTF8
-      Write-Host "Non Human Identity information saved to: $outputUserAsServiceAccount" -ForegroundColor Green
+    if ($subs.Count -gt 0) {
+        $subs | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+        Write-Host "[$Domain] Exported $($subs.Count) service accounts to: $OutputFile" -ForegroundColor Green
     } else {
-      Write-Host "No Non Human Identity found with the specified naming convention(s)." -ForegroundColor Yellow
+        Write-Host "[$Domain] No service accounts matched." -ForegroundColor Cyan
     }
-  }
-} 
+}
 
-# Display summary
-Write-Host "Total Enabled Users: $TotalEnabled"
-Write-Host "Active Users (Last 6 Months): $TotalActive"
-Write-Host "Inactive Users (No Login in 6+ Months): $TotalInactive"
-Write-Host "Users with No Recorded Login: $TotalNeverLoggedIn"
-Write-Host "Managed Service Account: $TotalManagedService"
-Write-Host "Grouped Managed Service Account: $TotalGroupManagedService"
-Write-Host "User with Password never Expires: $TotalUserPasswordNotExpired"
-Write-Host "User with Specific Name starting with svc : $TotalUserWithSpecificName"
+# Collect domains
+if ($SpecificDomains) {
+    $domainsToScan = $SpecificDomains
+} else {
+    $domainsToScan = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest().Domains | ForEach-Object { $_.Name }
+}
 
-# File summary
-"Total Enabled Users: $TotalEnabled" | Add-Content $outputSummary
-"Active Users (Last 6 Months): $TotalActive"  | Add-Content $outputSummary
-"Inactive Users (No Login in 6+ Months): $TotalInactive" | Add-Content $outputSummary
-"Users with No Recorded Login: $TotalNeverLoggedIn" | Add-Content $outputSummary
-"Managed Service Account: $TotalManagedService" | Add-Content $outputSummary
-"Grouped Managed Service Account: $TotalGroupManagedService" | Add-Content $outputSummary
-"User with Password never Expires: $TotalUserPasswordNotExpired" | Add-Content $outputSummary
-"User with Specific Name starting with svc : $TotalUserWithSpecificName" | Add-Content $outputSummary
+# Loop over each domain
+foreach ($domainName in $domainsToScan) {
+    Write-Host "`n🔎 Processing domain: $domainName" -ForegroundColor Cyan
+
+    # Export service accounts if patterns are given
+    if ($UserServiceAccountNamesLike) {
+        $svcOutFile = Join-Path $outputPath "svc_accounts_$($domainName.Replace('.', '_'))_$fileDate.csv"
+        Get-UsersAsServiceAccount -NamePatterns $UserServiceAccountNamesLike -Domain $domainName -OutputFile $svcOutFile
+    }
+
+    try {
+        $users = Get-ADUser -Server $domainName -Filter {Enabled -eq $true} -Properties LastLogonTimestamp, DistinguishedName
+
+        foreach ($user in $users) {
+            $ou = Get-OUFromDN $user.DistinguishedName
+            $entry = $summary | Where-Object { $_.Domain -eq $domainName -and $_.OU -eq $ou }
+            if (-not $entry) {
+                $entry = [PSCustomObject]@{
+                    Domain             = $domainName
+                    OU                 = $ou
+                    TotalUsers         = 0
+                    ActiveUsers        = 0
+                    InactiveUsers      = 0
+                    NeverLoggedInUsers = 0
+                }
+                $summary += $entry
+            }
+            $entry.TotalUsers++
+            if ($user.LastLogonTimestamp) {
+                if ($user.LastLogonTimestamp -ge $logonThreshold) {
+                    $entry.ActiveUsers++
+                } else {
+                    $entry.InactiveUsers++
+                }
+            } else {
+                $entry.NeverLoggedInUsers++
+            }
+        }
+    } catch {
+        Write-Warning "⚠️ Failed to process domain '$domainName': $_"
+    }
+}
+
+# Final output for Users and OU
+switch ($Mode) {
+    "UserPerOU" {
+        $summary | Sort-Object Domain, OU | Format-Table -AutoSize
+        $summaryPath = Join-Path $outputPath "OU_UserLogonBreakdown_$fileDate.csv"
+        $summary | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
+        Write-Host "`n✅ Exported OU breakdown to: $summaryPath" -ForegroundColor Green
+    }
+    
+    "Summary" {
+        $domainSummaries = $summary |
+            Group-Object Domain |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    Domain             = $_.Name
+                    TotalUsers         = ($_.Group | Measure-Object -Property TotalUsers -Sum).Sum
+                    ActiveUsers        = ($_.Group | Measure-Object -Property ActiveUsers -Sum).Sum
+                    InactiveUsers      = ($_.Group | Measure-Object -Property InactiveUsers -Sum).Sum
+                    NeverLoggedInUsers = ($_.Group | Measure-Object -Property NeverLoggedInUsers -Sum).Sum
+                }
+            }
+
+        $domainSummaries | Sort-Object Domain | Format-Table -AutoSize
+
+        $summaryPath = Join-Path $outputPath "DomainLevelSummary_$fileDate.csv"
+        $domainSummaries | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
+        Write-Host "`n✅ Exported domain-level summary to: $summaryPath" -ForegroundColor Green
+    }
+
+}
+
+# -- Service Account Summary (Per-Domain) --   
+Write-Host "`n📊 Now collecting service account statistics per domain..." -ForegroundColor Cyan
+
+$domainAccountSummaries = @()
+
+foreach ($domain in $domainsToScan) {
+    Write-Host "`n📦 Processing service accounts for: $domain" -ForegroundColor Yellow
+    try {
+        $managedAccounts = Get-ADServiceAccount -Server $domain -Filter * |
+            Where-Object { $_.ObjectClass -eq "msDS-ManagedServiceAccount" }
+
+        $groupManagedAccounts = Get-ADServiceAccount -Server $domain -Filter * |
+            Where-Object { $_.ObjectClass -eq "msDS-GroupManagedServiceAccount" }
+
+        $nonExpiringUsers = Get-ADUser -Server $domain -Filter { PasswordNeverExpires -eq $true }
+
+        $summary = [PSCustomObject]@{
+            Domain                        = $domain
+            ManagedServiceAccounts        = ($managedAccounts | Measure-Object).Count
+            GroupManagedServiceAccounts   = ($groupManagedAccounts | Measure-Object).Count
+            UsersWithPasswordNeverExpires = ($nonExpiringUsers | Measure-Object).Count
+        }
+
+        $domainAccountSummaries += $summary
+    }
+    catch {
+        Write-Warning "⚠️ Failed to query service account data for domain '$domain': $_"
+    }
+}
+
+$domainAccountSummaries | Sort-Object Domain | Format-Table -AutoSize
+
+# 💾 Export per-domain summary
+$servicePerDomainPath = Join-Path $outputPath "ServiceAccountSummary_PerDomain_$fileDate.csv"
+$domainAccountSummaries | Export-Csv -Path $servicePerDomainPath -NoTypeInformation -Encoding UTF8
+Write-Host "`n✅ Exported per-domain service account summary to: $servicePerDomainPath" -ForegroundColor Green
 
 Write-Host
-Write-Host "Results have been saved into $outputSummary. Please send all the files within the directory to your Rubrik Sales representative." -ForegroundColor Green
+Write-Host "Results have been saved into $outputPath. Please send all the files within the directory to your Rubrik Sales representative." -ForegroundColor Green
 
 # Reset Culture settings back to original value
 [System.Threading.Thread]::CurrentThread.CurrentCulture = $CurrentCulture
