@@ -1,0 +1,298 @@
+# ───── 🔧 1. Prerequisite Check ─────
+function Initialize-Prerequisites {
+    $requiredPSVersion = [Version]"5.1"
+    $moduleName = "ActiveDirectory"
+
+    if ($PSVersionTable.PSVersion -lt $requiredPSVersion) {
+        Write-Error "❌ PowerShell $requiredPSVersion or higher is required."
+        exit
+    }
+
+    try {
+        if (-not (Get-Module -ListAvailable -Name $moduleName)) {
+            Write-Error "❌ Required module '$moduleName' not found. Install RSAT: Active Directory Tools."
+            exit
+        }
+        Import-Module $moduleName -ErrorAction Stop
+    } catch {
+        Write-Error "❌ Failed to import '$moduleName'. $_"
+        exit
+    }
+
+    $script:OriginalCulture = [System.Globalization.CultureInfo]::CurrentCulture
+    $script:OriginalUICulture = [System.Globalization.CultureInfo]::CurrentUICulture
+
+    [System.Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+    [System.Threading.Thread]::CurrentThread.CurrentUICulture = 'en-US'
+
+    Write-Host "✅ Environment initialized." -ForegroundColor Green
+}
+
+# ───── 🧠 OU Extract Helper ─────
+function Get-OUFromDN {
+    param ($dn)
+    ($dn -split '(?<!\\),')[1..($dn.Count - 1)] -join ','
+}
+
+# ───── 🔍 Pattern-Based Match & Export ─────
+function Get-UsersAsServiceAccount {
+    param (
+        [string[]]$NamePatterns,
+        [string]$Domain,
+        [string]$OutputFile
+    )
+
+    $matchesService = @()
+    foreach ($pattern in $NamePatterns) {
+        Write-Host "[$Domain] Searching '$pattern'..." -ForegroundColor Yellow
+        try {
+            $users = Get-ADUser -Server $Domain -Filter "Name -like '$($pattern.Trim())'" `
+                -Properties Name, DistinguishedName, Enabled, LastLogonTimestamp, PasswordNeverExpires, ServicePrincipalName |
+                Select-Object Name, DistinguishedName, Enabled,
+                    @{Name="LastLogonDate";Expression={[DateTime]::FromFileTime($_.LastLogonTimestamp)}},
+                    PasswordNeverExpires,
+                    @{Name="ServicePrincipalNames";Expression={ $_.ServicePrincipalName -join ";" }}
+
+            $matchesService += $users
+        } catch {
+            Write-Warning "[$Domain] Pattern '$pattern' failed: $_"
+        }
+    }
+
+    if ($matchesService.Count -gt 0) {
+        $matchesService | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+        Write-Host "[$Domain] Exported $($matchesService.Count) service account matches." -ForegroundColor Green
+    }
+}
+
+# ───── 📊 OU-Level Summary with Full Flag Logic ─────
+function Get-UserOUStatsPerDomain {
+    param (
+        [string]$Domain,
+        [datetime]$LogonThreshold,
+        [string[]]$ServiceAccountPatterns
+    )
+
+    Write-Host "`n🔍 Auditing users in $Domain..." -ForegroundColor Cyan
+    $ouSummary = @()
+
+    $msaNames = Get-ADServiceAccount -Server $Domain -Filter {ObjectClass -eq "msDS-ManagedServiceAccount"} | Select-Object -ExpandProperty SamAccountName
+    $gmsaNames = Get-ADServiceAccount -Server $Domain -Filter {ObjectClass -eq "msDS-GroupManagedServiceAccount"} | Select-Object -ExpandProperty SamAccountName
+    $knownSA = $msaNames + $gmsaNames
+
+    $users = Get-ADUser -Server $Domain -Filter {Enabled -eq $true} `
+             -Properties SamAccountName, LastLogonTimestamp, DistinguishedName, PasswordNeverExpires
+
+    foreach ($user in $users) {
+        $ou = Get-OUFromDN $user.DistinguishedName
+        $entry = $ouSummary | Where-Object { $_.OU -eq $ou }
+
+        if (-not $entry) {
+            $entry = [PSCustomObject]@{
+                Domain             = $Domain
+                OU                 = $ou
+                TotalUsers         = 0
+                ActiveUsers        = 0
+                InactiveUsers      = 0
+                NeverLoggedInUsers = 0
+                ServiceAccounts    = 0
+            }
+            $ouSummary += $entry
+        }
+
+        $entry.TotalUsers++
+        if ($user.LastLogonTimestamp) {
+            if ($user.LastLogonTimestamp -ge $LogonThreshold.ToFileTime()) {
+                $entry.ActiveUsers++
+            } else {
+                $entry.InactiveUsers++
+            }
+        } else {
+            $entry.NeverLoggedInUsers++
+        }
+
+        $matchPattern = $false
+        if ($ServiceAccountPatterns) {
+            foreach ($pattern in $ServiceAccountPatterns) {
+                if ($user.SamAccountName -like $pattern) {
+                    $matchPattern = $true; break
+                }
+            }
+        }
+
+        if (
+            $user.PasswordNeverExpires -eq $true -or
+            ($knownSA -contains $user.SamAccountName) -or
+            $matchPattern
+        ) {
+            $entry.ServiceAccounts++
+        }
+    }
+
+    return $ouSummary
+}
+
+# ───── 📋 Per-User Detail Report with Service Account Flag ─────
+function Get-PerUserSummaryWithServiceFlag {
+    param (
+        [string]$Domain,
+        [datetime]$LogonThreshold,
+        [string[]]$ServiceAccountPatterns
+    )
+
+    $results = @()
+
+    $msa = Get-ADServiceAccount -Server $Domain -Filter {ObjectClass -eq "msDS-ManagedServiceAccount"} | Select-Object -ExpandProperty SamAccountName
+    $gmsa = Get-ADServiceAccount -Server $Domain -Filter {ObjectClass -eq "msDS-GroupManagedServiceAccount"} | Select-Object -ExpandProperty SamAccountName
+    $known = $msa + $gmsa
+
+    $users = Get-ADUser -Server $Domain -Filter {Enabled -eq $true} `
+             -Properties SamAccountName, LastLogonTimestamp, DistinguishedName, PasswordNeverExpires
+
+    foreach ($user in $users) {
+        $isMatch = $false
+        if ($ServiceAccountPatterns) {
+            foreach ($pattern in $ServiceAccountPatterns) {
+                if ($user.SamAccountName -like $pattern) {
+                    $isMatch = $true; break
+                }
+            }
+        }
+
+        $isService = $user.PasswordNeverExpires -eq $true -or
+                     ($known -contains $user.SamAccountName) -or
+                     $isMatch
+
+        $results += [PSCustomObject]@{
+            Domain              = $Domain
+            SamAccountName      = $user.SamAccountName
+            OU                  = Get-OUFromDN $user.DistinguishedName
+            LastLogonDate       = if ($user.LastLogonTimestamp) { [datetime]::FromFileTime($user.LastLogonTimestamp) } else { $null }
+            PasswordNeverExpires = $user.PasswordNeverExpires
+            IsServiceAccount    = $isService
+        }
+    }
+
+    return $results
+}
+
+# ───── 🧮 Domain-Level Totals ─────
+function Get-ServiceAccountSummaryPerDomain {
+    param ([string]$Domain)
+
+    $msa = Get-ADServiceAccount -Server $Domain -Filter {ObjectClass -eq "msDS-ManagedServiceAccount"} | Measure-Object | Select-Object -ExpandProperty Count
+    $gmsa = Get-ADServiceAccount -Server $Domain -Filter {ObjectClass -eq "msDS-GroupManagedServiceAccount"} | Measure-Object | Select-Object -ExpandProperty Count
+    $noExpire = Get-ADUser -Server $Domain -Filter { PasswordNeverExpires -eq $true } | Measure-Object | Select-Object -ExpandProperty Count
+
+    return [PSCustomObject]@{
+        Domain                        = $Domain
+        ManagedServiceAccounts        = $msa
+        GroupManagedServiceAccounts   = $gmsa
+        UsersWithPasswordNeverExpires = $noExpire
+    }
+}
+
+# ───── 🧾 Exporters ─────
+function Export-UserSummary {
+    param (
+        [array]$UserSummary,
+        [ValidateSet("UserPerOU", "Summary")] [string]$Mode,
+        [string]$OutputPath,
+        [string]$Timestamp
+    )
+
+    if (-not $UserSummary -or $UserSummary.Count -eq 0) {
+        Write-Warning "⚠️ No user summary data to export."
+        return
+    }
+
+    switch ($Mode) {
+        "UserPerOU" {
+            $file = Join-Path $OutputPath "OU_UserLogonBreakdown_$Timestamp.csv"
+            $UserSummary | Sort-Object Domain, OU | Format-Table -AutoSize
+            $UserSummary | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+            Write-Host "`n✅ Exported OU-level breakdown to: $file" -ForegroundColor Green
+        }
+
+        "Summary" {
+            $domainSummaries = $UserSummary |
+                Group-Object Domain |
+                ForEach-Object {
+                    [PSCustomObject]@{
+                        Domain             = $_.Name
+                        TotalUsers         = ($_.Group | Measure-Object -Property TotalUsers -Sum).Sum
+                        ActiveUsers        = ($_.Group | Measure-Object -Property ActiveUsers -Sum).Sum
+                        InactiveUsers      = ($_.Group | Measure-Object -Property InactiveUsers -Sum).Sum
+                        NeverLoggedInUsers = ($_.Group | Measure-Object -Property NeverLoggedInUsers -Sum).Sum
+                        ServiceAccounts    = ($_.Group | Measure-Object -Property ServiceAccounts -Sum).Sum
+                    }
+                }
+
+            $file = Join-Path $OutputPath "DomainLevelSummary_$Timestamp.csv"
+            $domainSummaries | Sort-Object Domain | Format-Table -AutoSize
+            $domainSummaries | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+            Write-Host "`n✅ Exported domain-level summary to: $file" -ForegroundColor Green
+        }
+    }
+}
+
+function Invoke-ADAudit {
+    param (
+        [string[]]$SpecificDomains,
+        [string[]]$UserServiceAccountNamesLike,
+        [ValidateSet("UserPerOU", "Summary")] [string]$Mode = "UserPerOU"
+    )
+
+    Initialize-Prerequisites
+
+    $timestamp = (Get-Date).ToString("yyyy-MM-dd_HHmm")
+    $logonThreshold = (Get-Date).AddDays(-180)
+    $outputPath = ".\ADReports"
+    if (-not (Test-Path $outputPath)) { New-Item $outputPath -ItemType Directory | Out-Null }
+
+    $domains = if ($SpecificDomains) { $SpecificDomains } else {
+        [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest().Domains | ForEach-Object { $_.Name }
+    }
+
+    $fullUserSummary = @()
+    $fullServiceSummary = @()
+
+    foreach ($domain in $domains) {
+        # Optional: Pattern-based export of service account-like users
+        if ($UserServiceAccountNamesLike) {
+            $svcPath = Join-Path $outputPath "svc_accounts_$($domain.Replace('.', '_'))_$timestamp.csv"
+            Get-UsersAsServiceAccount -NamePatterns $UserServiceAccountNamesLike -Domain $domain -OutputFile $svcPath
+        }
+
+        # Per-OU user logon and service account detection
+        $ouStats = Get-UserOUStatsPerDomain -Domain $domain -LogonThreshold $logonThreshold -ServiceAccountPatterns $UserServiceAccountNamesLike
+        $fullUserSummary += $ouStats
+
+        # Per-user detail export with flags
+        $userRows = Get-PerUserSummaryWithServiceFlag -Domain $domain -LogonThreshold $logonThreshold -ServiceAccountPatterns $UserServiceAccountNamesLike
+        if ($userRows) {
+            $userCsv = Join-Path $outputPath "PerUserSummary_$($domain.Replace('.', '_'))_$timestamp.csv"
+            $userRows | Export-Csv -Path $userCsv -NoTypeInformation -Encoding UTF8
+            Write-Host "✅ Exported detailed per-user summary: $userCsv" -ForegroundColor Green
+        }
+
+        # Domain-wide service account stats
+        $svcSummary = Get-ServiceAccountSummaryPerDomain -Domain $domain
+        if ($svcSummary) { $fullServiceSummary += $svcSummary }
+    }
+
+    # Export all collected summaries
+    Export-UserSummary -UserSummary $fullUserSummary -Mode $Mode -OutputPath $outputPath -Timestamp $timestamp
+
+    $svcAggFile = Join-Path $outputPath "ServiceAccountSummary_PerDomain_$timestamp.csv"
+    $fullServiceSummary | Sort-Object Domain | Export-Csv -Path $svcAggFile -NoTypeInformation -Encoding UTF8
+    Write-Host "`n✅ Exported per-domain service account summary: $svcAggFile" -ForegroundColor Green
+
+    Write-Host
+    Write-Host "🎁 Results saved to: $outputPath" -ForegroundColor Green
+    Write-Host "📨 Please share these reports with your Rubrik representative." -ForegroundColor Green
+
+    # Restore user culture settings
+    [System.Threading.Thread]::CurrentThread.CurrentCulture = $script:OriginalCulture
+    [System.Threading.Thread]::CurrentThread.CurrentUICulture = $script:OriginalUICulture
+}
