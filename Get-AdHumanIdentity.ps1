@@ -32,7 +32,7 @@
         - 'Summary': consolidated view per domain
 
 .EXAMPLE
-    .\Audit-ADUsers.ps1 -SpecificDomains "corp.domain.local" -UserServiceAccountNamesLike "*svc*","*_bot" -Mode UserPerOU
+    .\Get-AdHumanIdentity.ps1 -SpecificDomains "corp.domain.local" -UserServiceAccountNamesLike "*svc*","*_bot" -Mode UserPerOU
 
     This command:
         - Targets only corp.domain.local
@@ -41,7 +41,7 @@
         - Outputs results to .\ADReports\UserAudit_UserPerOU_<timestamp>.csv
 
 .EXAMPLE
-    .\Audit-ADUsers.ps1
+    .\Get-AdHumanIdentity.ps1
 
     This default call:
         - Targets all domains in the forest
