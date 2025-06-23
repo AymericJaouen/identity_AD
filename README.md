@@ -39,7 +39,7 @@ This PowerShell script audits Active Directory users and service accounts across
 ### 🧪 Example Usage
 
 ```powershell
-.\Audit-ADUsers.ps1 `
+.\Get-AdHumanIdentity.ps1 `
     -SpecificDomains "corp.domain.local","emea.domain.local" `
     -UserServiceAccountNamesLike "*svc*","*_bot","backup*" `
     -Mode "Summary"
