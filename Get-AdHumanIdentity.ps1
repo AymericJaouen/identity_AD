@@ -281,14 +281,13 @@ switch ($Mode) {
                 }
             }
         
-        $summaryGrouped | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
         Write-Host "Domain Summary Report" -ForegroundColor Green
         $summaryGrouped | Sort-Object Domain | Format-Table -AutoSize
         $summaryGrouped | Export-Csv -Path $fullExportPath -NoTypeInformation -Encoding UTF8
     }
 }
 
-Write-Host "Results have been saved into $outputPath. Please send all the files within the directory to your Rubrik Sales representative." -ForegroundColor Green
+Write-Host "Results have been saved into $fullExportPath. Please send all the files within the directory to your Rubrik Sales representative." -ForegroundColor Green
 
 # Reset Culture settings back to original value
 [System.Threading.Thread]::CurrentThread.CurrentCulture = $OriginalCulture
