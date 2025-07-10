@@ -174,7 +174,7 @@ $domainsToAudit = if ($SpecificDomains) {
 }
 
 foreach ($domain in $domainsToAudit) {
-    Write-Host "`n🔍 Auditing domain: $domain" -ForegroundColor Cyan
+    Write-Host "Auditing domain: $domain" -ForegroundColor Cyan
 
     try {
         # Preload reference data
@@ -247,7 +247,6 @@ foreach ($domain in $domainsToAudit) {
         Write-Warning "Failed processing domain $domain : $_"
     }
 }
-
 # =====================
 # Report Output
 # =====================
